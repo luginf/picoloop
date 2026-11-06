@@ -5,7 +5,8 @@
 //
 // See README.md for the mapping. The heavier tools/cctconv does the same
 // with the real picoloop and chipnomad_lib code; this one copies the
-// formats as written by picoloop 0.80 and ChooChooTracker module 12.0.
+// formats as written by picoloop 0.80 and read by ChooChooTracker
+// (module versions 6.0 to 12.0).
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
@@ -316,8 +317,15 @@ static bool writeCct(const Song& s, const string& path, string* error) {
     *error = "cannot write " + path;
     return false;
   }
-  fprintf(f, "# ChooChooTracker Module 12.0\n\n- Title: %s\n- Author: \n- Frame rate: %f\n- Chips count: 8\n",
-          s.title.c_str(), s.tickRate);
+  // Announce the oldest format version the content needs, so that released
+  // trackers (which read up to 9.0) open the file: 6.0 for 0-127 phrase
+  // volumes and OPL2, 7.0 when a SID instrument is present. The current
+  // tracker reads these blocks the same way under any of these versions.
+  int version = 6;
+  for (const Instrument& inst : s.instruments)
+    if (inst.used && inst.type == T_SID) version = 7;
+  fprintf(f, "# ChooChooTracker Module %d.0\n\n- Title: %s\n- Author: \n- Frame rate: %f\n- Chips count: 8\n",
+          version, s.title.c_str(), s.tickRate);
   fprintf(f, "- Track volumes: 100,100,100,100,100,100,100,100\n- Linear pitch: 1\n- Signed track speed: 1\n"
              "- Perceptual effects: 1\n- Chip type: AY8910\n- *AY8910* Clock: 1773400\n- *AY8910* AY/YM: 0\n"
              "- *AY8910* Stereo: ABC\n- *AY8910* Stereo separation: 50\n- *AY8910* PWM range: 0\n");
