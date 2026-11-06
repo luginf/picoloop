@@ -5,7 +5,8 @@ modèles et ce qui est perdu), mais **un seul fichier sans aucune dépendance** 
 ni le code de ChooChooTracker, ni celui de picoloop.
 
 ```
-g++ -std=c++17 -O2 -o pico2cct pico2cct.cpp
+make                 # ou : g++ -std=c++17 -O2 -o pico2cct pico2cct.cpp
+make install         # copie dans /usr/local/bin (PREFIX=... pour changer)
 
 pico2cct to-cct      <dossier bank picoloop> <morceau.cct> [--length N] [--title TEXTE]
 pico2cct to-picoloop <morceau.cct> <dossier bank picoloop> [--force]
