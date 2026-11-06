@@ -235,6 +235,9 @@ struct Instrument {
   int type = 0;
   int wave = 1, model = 0, cutoff = 1000, resonance = 0;  // aChChid
   int channel = 0;                                        // MIDI
+  // DrumSynth (defaults of a new DrumSynth instrument)
+  int engine = 0, drumDecay = 72, tone = 128, sweep = 150, noise = 24, fm = 32, drive = 28;
+  int filterEnabled = 1, filterMode = 0, filterCutoff = 20000, filterResonance = 0;
 };
 
 struct Song {
@@ -286,9 +289,13 @@ static string chipData(const Instrument& inst) {
                inst.wave, inst.model, inst.cutoff, inst.resonance);
       return b;
     case T_DRUMSYNTH:
-      return "- Engine: 0\n- Drum decay: 72\n- Tone: 128\n- Sweep: 150\n- Noise: 24\n- FM: 32\n- Drive: 28\n"
-             "- Filter enabled: 1\n- Filter character: 2\n- Filter mode: 0\n- Filter slope: 0\n"
-             "- Filter cutoff: 20000\n- Filter resonance: 0\n- Filter color: 128\n";
+      snprintf(b, sizeof(b),
+               "- Engine: %d\n- Drum decay: %d\n- Tone: %d\n- Sweep: %d\n- Noise: %d\n- FM: %d\n- Drive: %d\n"
+               "- Filter enabled: %d\n- Filter character: 2\n- Filter mode: %d\n- Filter slope: 0\n"
+               "- Filter cutoff: %d\n- Filter resonance: %d\n- Filter color: 128\n",
+               inst.engine, inst.drumDecay, inst.tone, inst.sweep, inst.noise, inst.fm, inst.drive,
+               inst.filterEnabled, inst.filterMode, inst.filterCutoff, inst.filterResonance);
+      return b;
     case T_OPL2:
       return "- OPL base: 1,0,0,0,0,0,3,3,0,0,0,0,60,0,0,0,0,0,0,0,0,0,0,0\n- OPL name: Soft FM Keys\n"
              "- OPL op0: 1,24,15,4,6,5,0,0,0,0,0,1\n- OPL op1: 1,0,15,3,5,5,0,0,0,0,0,1\n"
@@ -538,15 +545,96 @@ static int machineFor(const Instrument& inst) {
 }
 
 static int cutoffToHz(int c) { return (int)(200 * pow((double)CUTOFF_MAX_HZ / 200, c / 127.0) + 0.5); }
-static int cutoffFromHz(int hz) {
-  if (hz <= 200) return 0;
-  return clamp((int)(log(hz / 200.0) / log((double)CUTOFF_MAX_HZ / 200) * 127.0 + 0.5), 0, 127);
+static int cutoffFromHz(int hz) {  // the picoloop value whose conversion is closest: stable round trips
+  int best = 0;
+  for (int v = 1; v < 128; v++)
+    if (abs(cutoffToHz(v) - hz) < abs(cutoffToHz(best) - hz)) best = v;
+  return best;
 }
 static int resonanceTo(int r) { return (r * 100 + 63) / 127; }
 static int resonanceFrom(int r) {
   for (int v = 0; v < 128; v++)
     if (resonanceTo(v) >= r) return v;
   return 127;
+}
+
+// ---------------------------------------------------------------------------
+// PicoDrum -> DrumSynth
+//
+// PicoDrum (Machine/Picodrum) is two oscillators mixed by VCOMix
+// (osc1 * (128 - mix) + osc2 * mix) -- or, when LFO1 speed and depth are both
+// set, osc2 alone with its pitch wobbled by osc1 running at the LFO speed --
+// an optional pitch bend, a one-shot
+// envelope of (attack + 10 + release) * 256 samples that ignores the note
+// length, and a filter: AMSynth low pass at (cutoff / 128)^2 * 8192 Hz, or a
+// biquad at (cutoff / 256)^2 * 44100 Hz whose types 0/1/2 are low, high and
+// band pass. The DrumSynth engine is chosen from the share of noise in the
+// mix; its decay matches the PicoDrum length, and its sweep, FM and drive,
+// which PicoDrum does not have, are turned off.
+
+static const int WT_SINE = 0, WT_SAW = 1, WT_PULSE = 2, WT_TRGL = 3, WT_SMSAW = 5, WT_SMPULSE = 6,
+                 WT_NOISE = 8, WT_LFSRNOISE = 9;
+enum { E_KICK = 0, E_SNARE = 1, E_HAT = 2, E_TOM = 4, E_NOISE = 7, E_CYMBAL = 9 };
+
+struct PicoDrumSound {
+  int osc1, osc2, mix, pbDepth, pbSpeed, attack, release, cutoff, resonance, filterType, filterAlgo, lfoSpeed,
+      lfoDepth;
+  bool operator<(const PicoDrumSound& o) const {
+    const int a[] = {osc1, osc2, mix, pbDepth, pbSpeed, attack, release, cutoff, resonance, filterType, filterAlgo,
+                     lfoSpeed, lfoDepth};
+    const int b[] = {o.osc1, o.osc2, o.mix, o.pbDepth, o.pbSpeed, o.attack, o.release, o.cutoff, o.resonance,
+                     o.filterType, o.filterAlgo, o.lfoSpeed, o.lfoDepth};
+    return std::lexicographical_compare(a, a + 13, b, b + 13);
+  }
+};
+
+static int param(const Pattern& pat, const char* name, int step) { return pat.v[paramIndex(name)][step]; }
+
+static PicoDrumSound picoDrumSound(const Pattern& pat, int step) {
+  return {param(pat, "OscOneType", step),     param(pat, "OscTwoType", step),     param(pat, "VCOMix", step),
+          param(pat, "PitchBendDepth", step), param(pat, "PitchBendSpeed", step), param(pat, "Attack", step),
+          param(pat, "Release", step),        param(pat, "Cutoff", step),         param(pat, "Resonance", step),
+          param(pat, "FilterType", step),     param(pat, "FilterAlgo", step),     param(pat, "LFO1Speed", step),
+          param(pat, "LFO1Depth", step)};
+}
+
+static void picoDrumToDrumSynth(const PicoDrumSound& d, int note, Instrument* inst) {
+  auto isNoise = [](int osc) { return osc == WT_NOISE || osc == WT_LFSRNOISE; };
+  int mix = clamp(d.mix, 1, 127);  // the VCO treats 0 as 1
+  bool lfo = d.lfoSpeed > 0 && d.lfoDepth > 0;
+  double noise = lfo ? (isNoise(d.osc2) ? 1.0 : 0.0)
+                     : (isNoise(d.osc1) ? (128 - mix) / 128.0 : 0) + (isNoise(d.osc2) ? mix / 128.0 : 0);
+  int tonal = lfo ? d.osc2 : !isNoise(d.osc1) && (128 - mix) >= mix ? d.osc1 : !isNoise(d.osc2) ? d.osc2 : d.osc1;
+  bool sweep = !lfo && d.pbSpeed > 0 && d.pbDepth != 64;
+  double seconds = (clamp(d.attack, 0, 127) + 10 + clamp(d.release, 0, 127)) * 256 / 44100.0;
+  double cutoffHz = d.filterAlgo == 2 ? (d.cutoff / 128.0) * (d.cutoff / 128.0) * 8192
+                  : d.filterAlgo == 1 ? (d.cutoff / 256.0) * (d.cutoff / 256.0) * 44100 : CUTOFF_MAX_HZ;
+  int mode = d.filterAlgo == 1 ? (d.filterType == 1 ? 2 : d.filterType == 2 ? 1 : 0) : 0;  // CCT 0 LP, 1 BP, 2 HP
+  bool bright = mode == 2 || mode == 1 || cutoffHz > 6000;
+
+  if (noise >= 0.75) inst->engine = bright ? (seconds > 0.35 ? E_CYMBAL : E_HAT) : E_NOISE;
+  else if (noise >= 0.2) inst->engine = E_SNARE;
+  else if (sweep && note <= 36) inst->engine = E_KICK;  // C-2 and below
+  else inst->engine = E_TOM;
+
+  double durationScale = inst->engine == E_HAT ? 1.55 : 2.0;  // DrumSynthVoice::noteOn()
+  inst->drumDecay = clamp((int)(255 * sqrt(std::max(seconds - 0.018, 0.0) / durationScale) + 0.5), 0, 255);
+  inst->noise = clamp((int)(noise * 255 + 0.5), 0, 255);
+  // Tone sets how far the body sits from the played note: keep it on the note.
+  inst->tone = inst->engine == E_SNARE ? 85 : inst->engine == E_TOM ? 73 : 128;
+  if (inst->engine == E_SNARE && (tonal == WT_SAW || tonal == WT_SMSAW || tonal == WT_PULSE || tonal == WT_SMPULSE))
+    inst->tone = 120;  // brighter body for saw and pulse
+  inst->sweep = sweep ? clamp(abs(d.pbDepth - 64) * 4 * std::min(d.pbSpeed, 16) / 16 + 40, 0, 255) : 0;
+  // The LFO wobble (up to |osc1| / (128 - depth) / 128 semitones) roughens
+  // a tonal body: render it as some FM. PicoDrum has no FM otherwise.
+  inst->fm = lfo && noise < 0.75 ? clamp(d.lfoDepth * 2, 0, 255) : 0;
+  inst->drive = 0;
+  inst->filterEnabled = d.filterAlgo != 0;
+  inst->filterMode = mode;
+  inst->filterCutoff = clamp((int)(cutoffHz + 0.5), 20, CUTOFF_MAX_HZ);
+  // AMSynth resonance is resonance / 160 (0-0.8), the biquad's Q resonance / 8.
+  inst->filterResonance = d.filterAlgo == 2 ? clamp(d.resonance * 255 / 160, 0, 255)
+                        : d.filterAlgo == 1 ? clamp(d.resonance * 3, 0, 255) : 0;
 }
 
 struct Options {
@@ -565,6 +653,7 @@ static bool toCct(const Bank& bank, const Options& opt, Song* s, vector<string>*
   }
 
   std::map<std::pair<int, int>, int> grooves, instruments, chains;
+  std::map<std::pair<int, PicoDrumSound>, int> drums;  // one instrument per PicoDrum sound
   auto groove = [&](int divider, int swing) {
     auto key = std::make_pair(divider, swing);
     if (grooves.count(key)) return grooves[key];
@@ -600,11 +689,16 @@ static bool toCct(const Bank& bank, const Options& opt, Song* s, vector<string>*
     warn->push_back("patterns of different lengths at the same song position: picoloop moves the whole song on "
                     "when the first track loops, ChooChooTracker lets each track finish its chain");
 
+  int instrumentCount = 0;
   auto instrument = [&](int track, const Pattern& pat, int step) {
     int machine = clamp(pat.v[P_MACHINE][step], 0, M_COUNT - 1);
+    // PicoDrum sounds are set per step: each distinct sound gets its own
+    // instrument. The other machines get one instrument per track.
     auto key = std::make_pair(track, machine);
-    if (instruments.count(key)) return instruments[key];
-    int idx = (int)instruments.size();
+    auto drumKey = std::make_pair(track, machine == M_PICODRUM ? picoDrumSound(pat, step) : PicoDrumSound{});
+    if (machine == M_PICODRUM ? drums.count(drumKey) != 0 : instruments.count(key) != 0)
+      return machine == M_PICODRUM ? drums[drumKey] : instruments[key];
+    int idx = instrumentCount;
     if (idx >= CCT_INSTRUMENTS) return 0;
     Instrument& inst = s->instruments[idx];
     inst.used = true;
@@ -619,12 +713,15 @@ static bool toCct(const Bank& bank, const Options& opt, Song* s, vector<string>*
       inst.model = inst.wave != 2 ? 0 : osc == 8 || osc == 9 ? 41 : 3;    // Braids noise / sine-triangle
       inst.cutoff = cutoffToHz(pat.v[P_CUTOFF][step]);
       inst.resonance = resonanceTo(pat.v[P_RESONANCE][step]);
+    } else if (machine == M_PICODRUM) {
+      picoDrumToDrumSynth(drumKey.second, pat.v[P_NOTE][step], &inst);
     } else if (inst.type == T_MIDI) {
       inst.channel = track;
     } else if (inst.type == T_SAMPLE) {
       warn->push_back(inst.name + ": picoloop sampler, pick the sample in ChooChooTracker");
     }
-    return instruments[key] = idx;
+    instrumentCount++;
+    return machine == M_PICODRUM ? (drums[drumKey] = idx) : (instruments[key] = idx);
   };
 
   auto addPhrase = [&](const Phrase& ph) {
@@ -684,7 +781,7 @@ static bool toCct(const Bank& bank, const Options& opt, Song* s, vector<string>*
       s->song[pos][t] = c;
     }
   warn->insert(warn->begin(), std::to_string(length) + " song rows, " + std::to_string(s->chainCount) + " chains, " +
-                                  std::to_string(s->phraseCount) + " phrases, " + std::to_string(instruments.size()) +
+                                  std::to_string(s->phraseCount) + " phrases, " + std::to_string(instrumentCount) +
                                   " instruments, " + std::to_string(grooves.size()) + " grooves, " +
                                   std::to_string(bpm) + " BPM");
   return true;

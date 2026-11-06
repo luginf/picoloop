@@ -40,6 +40,31 @@ release `appimage-test-2` (« Incorrect module version »). Avec ces versions,
 utiliser `pico2cct`. La release `midi-2026-09-30` (module 5.0, ni OPL2 ni SID)
 n'est pas gérée.
 
+## Batteries PicoDrum
+
+Contrairement à `../cctconv`, `pico2cct` règle le DrumSynth d'après chaque son
+PicoDrum. Dans picoloop, les réglages PicoDrum peuvent changer à chaque pas :
+chaque son différent devient donc son propre instrument.
+
+- **Moteur** choisi selon la part de bruit dans le son : ≥ 75 % → charley
+  (filtre passe-haut/bande ou coupure > 6 kHz ; cymbale si le son dure plus de
+  0,35 s) ou bruit filtré ; 20 à 75 % → caisse claire ; sinon grosse caisse
+  (pitch bend et note ≤ C-2) ou tom. La part de bruit vient du mélange des deux
+  oscillateurs ; quand le LFO1 est actif (vitesse et profondeur non nulles),
+  PicoDrum ne joue que l'oscillateur 2, modulé en hauteur par l'oscillateur 1,
+  et c'est lui qui compte.
+- **Durée** : PicoDrum joue un son de (attaque + 10 + release) × 256
+  échantillons quelle que soit la longueur de la note ; le decay DrumSynth est
+  calculé pour durer autant.
+- **Filtre** : passe-bas AMSynth à (coupure/128)² × 8192 Hz, ou biquad à
+  (coupure/256)² × 44100 Hz (les types picoloop 1 et 2 du biquad sont en fait
+  passe-haut et passe-bande) ; résonance reprise.
+- Le balayage de hauteur, la FM et la saturation du DrumSynth, absents de
+  PicoDrum, sont coupés (sauf un peu de FM pour imiter la modulation du LFO).
+
+Le son reste celui du moteur DrumSynth : proche en caractère, pas identique.
+MDADrum et ER-1 gardent un DrumSynth par défaut.
+
 ## Vérification
 
 Sur les 7 démos livrées avec ChooChooTracker, comparé à `../cctconv` :
@@ -52,3 +77,6 @@ Sur les 7 démos livrées avec ChooChooTracker, comparé à `../cctconv` :
 - ouverture avec le chargeur de la release `appimage-test-2` (module 9.0),
   recompilé depuis son tag : les 7 fichiers et un fichier avec SID s'ouvrent ;
   sauvés par cette version puis reconvertis, ils redonnent les mêmes banks.
+- batteries : sur une bank réelle (65 coups PicoDrum, 10 sons différents),
+  chaque son donne un instrument DrumSynth réglé, le fichier s'ouvre dans la
+  release 9.0. Non vérifié à l'écoute.
